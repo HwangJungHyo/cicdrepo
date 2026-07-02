@@ -9,6 +9,18 @@ import (
 	"strings"
 )
 
+func fetchHandler(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.Query().Get("url") // source
+	resp, err := http.Get(target)      // sink
+	if err != nil {
+		http.Error(w, "error", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	_, _ = w.Write(body)
+}
+
 var version = "dev"
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
@@ -45,5 +57,6 @@ func main() {
 	http.HandleFunc("/healthz", healthzHandler)
 	http.HandleFunc("/version", versionHandler)
 	http.HandleFunc("/download", downloadHandler)
+	http.HandleFunc("/fetch", fetchHandler)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
