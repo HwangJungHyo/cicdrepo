@@ -21,3 +21,4 @@ func main() {
 	http.HandleFunc("/version", versionHandler)
 	http.ListenAndServe(":8080", nil)
 }
+
