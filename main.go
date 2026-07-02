@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 )
 
 var version = "dev"
@@ -20,5 +21,16 @@ func versionHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/healthz", healthzHandler)
 	http.HandleFunc("/version", versionHandler)
+	http.HandleFunc("/download", downloadHandler)
 	log.Fatal(http.ListenAndServe(":8080", nil))  // ② error를 실제 처리
+}
+
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	filename := r.URL.Query().Get("file") // source: 사용자 입력
+	data, err := os.ReadFile(filename)    // sink: 파일 시스템 접근
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	_, _ = w.Write(data)
 }
