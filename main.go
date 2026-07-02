@@ -2,22 +2,23 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 )
 
-var version = "dev" // 나중에 CI에서 ldflags로 주입할 자리
+var version = "dev"
 
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "ok")
+	_, _ = fmt.Fprintln(w, "ok")        // ① 의도적 무시를 명시
 }
 
 func versionHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, version)
+	_, _ = fmt.Fprintln(w, version)     // ① 동일
 }
 
 func main() {
 	http.HandleFunc("/healthz", healthzHandler)
 	http.HandleFunc("/version", versionHandler)
-	http.ListenAndServe(":8080", nil)
+	log.Fatal(http.ListenAndServe(":8080", nil))  // ② error를 실제 처리
 }

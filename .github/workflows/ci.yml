@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:                 
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build
+        run: go build ./...          # 빈칸 ②: 전체 패키지를 빌드하는 명령
+
+      - name: Test
+        run: go test -cover ./...          # 빈칸 ③: 전체 패키지 테스트 + 커버리지 출력 명령
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: golangci/golangci-lint-action@v8
