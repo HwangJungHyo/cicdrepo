@@ -1,0 +1,39 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'cicd-app/**'          # cicd-app 폴더가 바뀔 때만 실행
+
+permissions:
+  id-token: write              # OIDC 토큰 발급에 필수
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REGISTRY: 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com
+  ECR_REPO: testns/testrepo
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::713500447952:role/github-actions-cicd      # ← 방금 만든 역할 ARN
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        run: |
+          IMAGE=$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}
+          docker build -t $IMAGE ./cicd-app
+          docker push $IMAGE
+          echo "Pushed: $IMAGE"
