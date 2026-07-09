@@ -1,0 +1,63 @@
+name: Deploy to QA
+
+on:
+  push:
+    tags:
+      - 'qa-*'              # qa-로 시작하는 태그가 생길 때만 실행
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REGISTRY: 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com
+  ECR_REPO: testns/testrepo
+
+jobs:
+  deploy-qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (tagged commit)
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::713500447952:role/github-actions-cicd
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve image digest (NO rebuild)
+        id: img
+        run: |
+          # 태그가 가리키는 커밋 = 이미 빌드된 이미지의 태그
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "commit: $COMMIT_SHA"
+          # ECR에서 그 커밋 태그의 digest 조회 (재빌드 안 함!)
+          DIGEST=$(aws ecr describe-images \
+            --repository-name $ECR_REPO \
+            --image-ids imageTag=$COMMIT_SHA \
+            --region $AWS_REGION \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=$ECR_REGISTRY/$ECR_REPO@$DIGEST" >> $GITHUB_OUTPUT
+          echo "Promoting digest: $DIGEST"
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name unique-folk-rainbow --region $AWS_REGION
+
+      - name: Ensure qa ConfigMap
+        run: |
+          kubectl create configmap app-config \
+            --from-literal=ENV_NAME=qa \
+            --from-literal=LOG_LEVEL=info \
+            -n qa --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to qa (promote)
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${{ steps.img.outputs.digest }}|" cicd-app/deploy-dev.yaml
+          kubectl apply -f cicd-app/deploy-dev.yaml -n qa
+          kubectl rollout status deployment/cicdapp -n qa --timeout=300s
