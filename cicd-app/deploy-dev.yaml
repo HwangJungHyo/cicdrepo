@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
       - name: cicdapp
-        image: 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com/testns/testrepo@sha256:26cbd7b54346565318de9d7706273cf21dfabfb4a80748aa5749831d1c9b90e2
+        image: IMAGE_PLACEHOLDER
         ports:
         - containerPort: 8080
         envFrom:
