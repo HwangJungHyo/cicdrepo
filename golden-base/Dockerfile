@@ -1,15 +1,4 @@
-# =============================================================================
-# Golden Base Image — 조직 표준 런타임 베이스
-# =============================================================================
-# 원칙: digest pin (재현성) / distroless (최소 공격표면) / nonroot (권한최소)
-# 이 이미지는 Trivy 스캔(HIGH/CRITICAL 차단) 통과 후에만 ECR에 push됨.
-# 모든 앱은 이 이미지만 FROM으로 참조.
-# =============================================================================
-
-FROM gcr.io/distroless/static@sha256:d5f030ca7c5793784e9ea4178a116da360250411d13921a5af27c6cb5a5949bf
-
-LABEL org.opencontainers.image.title="golden-base"
-LABEL org.opencontainers.image.description="Organization-approved base image. Scanned and signed."
-LABEL org.opencontainers.image.vendor="Platform Engineering"
-
-USER 65532:65532
+# [실험] 화이트리스트가 ubuntu:20.04를 막는가?
+# 이전 파이프라인에서는 EOL이라 스캔 0건으로 통과했다.
+# 하드닝 후에는 스캔에 도달하기도 전에 차단되어야 한다.
+FROM ubuntu:20.04
