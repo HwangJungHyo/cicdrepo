@@ -14,7 +14,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app .
 
 # ---- 런타임 스테이지 (골든 이미지) ----
-FROM 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com/goldenns/golden-base@sha256:c966fe8c63ca70319334cf1dd37164c3fd7538a85a495920b9a76c961c741024
+FROM ubuntu:20.04
 
 COPY --from=build /app /app
 
