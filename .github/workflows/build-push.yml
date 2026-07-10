@@ -1,19 +1,39 @@
 name: Build and Push to ECR
 
+# =============================================================================
+# 앱 CI — 골든 이미지 강제
+#
+# 발행 파이프라인(golden-image.yml)이 승인된 베이스를 만든다면,
+# 이 워크플로는 앱이 그것만 쓰도록 강제한다.
+#
+# 게이트:
+#   1. 베이스 검사 — FROM이 골든 이미지 digest인지 (빌드 전 차단)
+#   2. 앱 이미지 스캔 — 앱이 추가한 취약점 (빌드 후 차단)
+#
+# "골든 이미지를 만들어뒀지만 쓰라고 강제하는 장치가 없다"는 구멍을 메운다.
+# =============================================================================
+
 on:
   push:
     branches: [main]
     paths:
-      - 'cicd-app/**'          # cicd-app 폴더가 바뀔 때만 실행
+      - 'cicd-app/**'
+      - '.github/workflows/build-push.yml'
+  pull_request:
+    paths:
+      - 'cicd-app/**'
 
 permissions:
-  id-token: write              # OIDC 토큰 발급에 필수
+  id-token: write
   contents: read
+  security-events: write
 
 env:
   AWS_REGION: ap-northeast-2
   ECR_REGISTRY: 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com
   ECR_REPO: testns/testrepo
+  GOLDEN_REPO: goldenns/golden-base
+  SEVERITY_GATE: 'HIGH,CRITICAL'
 
 jobs:
   build-push:
@@ -25,41 +45,132 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::713500447952:role/github-actions-cicd      # ← 방금 만든 역할 ARN
+          role-to-assume: arn:aws:iam::713500447952:role/github-actions-cicd
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push
+      # =====================================================================
+      # 게이트 1: 베이스 이미지 강제  ★ 골든 이미지를 "규칙"으로 만드는 장치 ★
+      #
+      # 런타임 스테이지의 FROM이 골든 이미지 digest여야 한다.
+      # 개발자가 FROM ubuntu:20.04 를 쓰면 빌드조차 되지 않는다.
+      # =====================================================================
+      - name: Enforce golden base image
         run: |
-          IMAGE=$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}
-          docker build -t $IMAGE ./cicd-app
-          docker push $IMAGE
-          echo "Pushed: $IMAGE"
+          # 마지막 FROM = 런타임 스테이지 (멀티스테이지 빌드)
+          RUNTIME_BASE=$(grep '^FROM' cicd-app/Dockerfile | tail -1 | awk '{print $2}')
+          echo "Runtime base: $RUNTIME_BASE"
 
-      - name: Build and push
+          EXPECTED="$ECR_REGISTRY/$GOLDEN_REPO@sha256:"
+
+          case "$RUNTIME_BASE" in
+            "$EXPECTED"*)
+              echo "골든 이미지를 사용합니다." ;;
+            "$ECR_REGISTRY/$GOLDEN_REPO":*)
+              echo "::error::골든 이미지를 태그로 참조했습니다. digest 참조가 필요합니다."
+              echo "::error::태그는 재지정될 수 있어 검증한 이미지와 배포된 이미지가 달라질 수 있습니다."
+              exit 1 ;;
+            *)
+              echo "::error::승인되지 않은 베이스 이미지: $RUNTIME_BASE"
+              echo "::error::런타임 베이스는 조직 골든 이미지여야 합니다."
+              echo "::error::형식: $EXPECTED<digest>"
+              echo "::error::최신 골든 이미지 digest는 Golden Image Pipeline 실행 결과에서 확인하세요."
+              exit 1 ;;
+          esac
+
+      # 참고: 사용 중인 골든 이미지가 ECR에 실제로 존재하는지도 확인
+      - name: Verify golden image exists in registry
+        run: |
+          RUNTIME_BASE=$(grep '^FROM' cicd-app/Dockerfile | tail -1 | awk '{print $2}')
+          DIGEST="sha256:${RUNTIME_BASE##*@sha256:}"
+          echo "Checking digest: $DIGEST"
+          aws ecr describe-images \
+            --repository-name "$GOLDEN_REPO" \
+            --image-ids imageDigest="$DIGEST" \
+            --region "$AWS_REGION" \
+            --query 'imageDetails[0].imageDigest' --output text
+          echo "골든 이미지가 레지스트리에 존재합니다."
+
+      - name: Build image (local only)
+        run: |
+          docker build -t app:candidate ./cicd-app
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      # =====================================================================
+      # 게이트 2: 앱 이미지 스캔
+      # 골든 베이스를 썼어도 앱이 추가한 의존성에 취약점이 있을 수 있다.
+      # =====================================================================
+      - name: Trivy scan app image (GATE)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: app:candidate
+          format: table
+          exit-code: '1'
+          severity: ${{ env.SEVERITY_GATE }}
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          cache-dir: ~/.cache/trivy
+
+      - name: Trivy scan (SARIF)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: app:candidate
+          format: sarif
+          output: trivy-app.sarif
+          severity: ${{ env.SEVERITY_GATE }}
+          cache-dir: ~/.cache/trivy
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-app.sarif
+
+      # =====================================================================
+      # Push — 게이트를 모두 통과한 것만. main 브랜치에서만.
+      # =====================================================================
+      - name: Push to ECR
         id: build
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
           IMAGE=$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}
-          docker build -t $IMAGE ./cicd-app
+          docker tag app:candidate $IMAGE
           docker push $IMAGE
-          # push 결과의 digest 추출
           DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Pushed: $DIGEST"
 
+      - name: Skip push notice
+        if: github.event_name == 'pull_request'
+        run: echo "::notice::PR 검증만 수행. push는 main 병합 후 실행됩니다."
+
+      # 배포는 main에서만
       - name: Setup kubectl
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: azure/setup-kubectl@v4
 
       - name: Update kubeconfig
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
-          aws eks update-kubeconfig \
-            --name unique-folk-rainbow \
-            --region $AWS_REGION
+          aws eks update-kubeconfig --name unique-folk-rainbow --region $AWS_REGION
 
       - name: Deploy to dev
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         run: |
-          # placeholder에 digest 치환
           sed -i "s|IMAGE_PLACEHOLDER|${{ steps.build.outputs.digest }}|" cicd-app/deploy-dev.yaml
           kubectl apply -f cicd-app/deploy-dev.yaml -n dev
           kubectl rollout status deployment/cicdapp -n dev --timeout=300s
