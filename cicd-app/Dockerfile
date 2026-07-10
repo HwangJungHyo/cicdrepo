@@ -1,11 +1,22 @@
-# 1단계: 빌드
-FROM golang:1.21 AS build
+# =============================================================================
+# cicd-app — 골든 이미지 기반
+# =============================================================================
+# 런타임 베이스는 반드시 조직 승인 골든 이미지만 사용한다.
+# 골든 이미지는 golden-image.yml에서 Trivy 스캔(HIGH/CRITICAL)을 통과한 것만
+# ECR에 발행되며, digest로 고정하여 참조한다.
+# =============================================================================
+
+# ---- 빌드 스테이지 (최종 이미지에 포함되지 않음) ----
+FROM golang:1.21@sha256:4746d26432a9117a5f58e95cb9f954ddf0de128e9d5816886514199316e4a2fb AS build
+
 WORKDIR /src
 COPY . .
-RUN CGO_ENABLED=0 go build -o /app .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app .
 
-# 2단계: 실행 (작은 이미지)
-FROM gcr.io/distroless/static
+# ---- 런타임 스테이지 (골든 이미지) ----
+FROM 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com/goldenns/golden-base@sha256:c966fe8c63ca70319334cf1dd37164c3fd7538a85a495920b9a76c961c741024
+
 COPY --from=build /app /app
+
 EXPOSE 8080
 ENTRYPOINT ["/app"]
