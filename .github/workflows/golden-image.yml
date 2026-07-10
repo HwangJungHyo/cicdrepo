@@ -1,0 +1,144 @@
+name: Golden Image Pipeline
+
+# 트리거 설계:
+#   1. golden-base/ 변경 시 → 재빌드
+#   2. 주간 스케줄 → 빌드 후 발견된 신규 CVE 탐지 (실무 필수)
+#   3. 수동 실행 → 긴급 CVE 대응
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'golden-base/**'
+      - '.github/workflows/golden-image.yml'
+  schedule:
+    - cron: '0 0 * * 1'      # 매주 월요일 09:00 KST
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '골든 이미지 버전 (semver)'
+        required: false
+        default: '1.0.0'
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REGISTRY: 713500447952.dkr.ecr.ap-northeast-2.amazonaws.com
+  GOLDEN_REPO: goldenns/golden-base
+  SEVERITY_GATE: 'HIGH,CRITICAL'
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version
+        id: ver
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building golden-base version: $VERSION"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::713500447952:role/github-actions-cicd
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # 로컬 빌드만 — 스캔 통과 전엔 절대 push 안 함
+      - name: Build golden base (local only)
+        run: |
+          docker build -t golden-base:candidate ./golden-base
+          echo "Built candidate (not pushed yet)"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      # ★ 게이트: exit-code 1 이 있어야 실제로 막힌다
+      - name: Trivy scan (GATE)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: golden-base:candidate
+          format: table
+          exit-code: '1'
+          severity: ${{ env.SEVERITY_GATE }}
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          cache-dir: ~/.cache/trivy
+
+      # 실패해도 결과는 기록 (추적성)
+      - name: Trivy scan (SARIF)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: golden-base:candidate
+          format: sarif
+          output: trivy-results.sarif
+          severity: ${{ env.SEVERITY_GATE }}
+          cache-dir: ~/.cache/trivy
+
+      - name: Upload SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      # SBOM: Log4Shell 때 영향 범위를 분 단위로 특정한 그것
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $PWD:/out aquasec/trivy:latest image \
+            --format cyclonedx --output /out/sbom-cyclonedx.json \
+            golden-base:candidate
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.ver.outputs.version }}
+          path: sbom-cyclonedx.json
+          retention-days: 90
+
+      # 스캔 통과한 것만 push
+      - name: Tag and push to ECR
+        id: push
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          IMAGE="$ECR_REGISTRY/$GOLDEN_REPO:$VERSION"
+          docker tag golden-base:candidate $IMAGE
+          docker push $IMAGE
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "::notice::Golden image published: $DIGEST"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Golden Image Published"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|------|-----|"
+            echo "| Version | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| Scan Gate | HIGH,CRITICAL (ignore-unfixed) |"
+            echo "| SBOM | CycloneDX (artifact) |"
+            echo ""
+            echo "### 앱 Dockerfile에서 사용법"
+            echo '```dockerfile'
+            echo "FROM ${{ steps.push.outputs.digest }}"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
