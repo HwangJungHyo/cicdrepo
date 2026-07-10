@@ -1,23 +1,41 @@
 name: Golden Image Pipeline
 
-# 트리거 설계:
-#   1. golden-base/ 변경 시 → 재빌드
-#   2. 주간 스케줄 → 빌드 후 발견된 신규 CVE 탐지 (실무 필수)
-#   3. 수동 실행 → 긴급 CVE 대응
+# =============================================================================
+# 골든 이미지 파이프라인 (다층 방어)
+#
+# 실험으로 발견한 구멍과 방어:
+#   [실험 1] distroless    → 취약점 0개, 통과 (정상)
+#   [실험 2] ubuntu:20.04  → EOL이라 스캔 데이터 없음 → 0개로 통과 (뚫림!)
+#   [실험 3] node:16       → HIGH 228/CRITICAL 11 → exit 1 차단 (정상)
+#
+# 방어 순서 (스캔은 마지막 방어선):
+#   1. 브랜치 검증   — main 외 push 금지
+#   2. 화이트리스트  — 승인된 베이스만 (스캔 이전 차단)
+#   3. 빌드 (로컬만)
+#   4. EOL 차단      — 스캔 데이터 없는 OS 거부
+#   5. 스캔 게이트   — exit-code 1
+#   6. SBOM
+#   7. Push          — 모두 통과한 것만
+#
+# 핵심: 스캔 "0건"은 "안전"이 아니라 "탐지 불가"일 수 있다.
+# =============================================================================
+
 on:
   push:
     branches: [main]
     paths:
       - 'golden-base/**'
       - '.github/workflows/golden-image.yml'
+  pull_request:
+    paths:
+      - 'golden-base/**'
   schedule:
-    - cron: '0 0 * * 1'      # 매주 월요일 09:00 KST
+    - cron: '0 0 * * 1'
   workflow_dispatch:
     inputs:
       version:
-        description: '골든 이미지 버전 (semver)'
+        description: '골든 이미지 버전 (semver). main 브랜치에서만 발행됩니다.'
         required: false
-        default: '1.0.0'
 
 permissions:
   id-token: write
@@ -37,6 +55,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 방어 1: 브랜치 검증
+      - name: Enforce main branch for publishing
+        id: gate_branch
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "publish=true" >> $GITHUB_OUTPUT
+            echo "main 브랜치 — 검증 통과 시 발행합니다."
+          else
+            echo "publish=false" >> $GITHUB_OUTPUT
+            echo "::notice::비-main 브랜치 — 검증만 수행하고 push는 차단됩니다."
+          fi
+
+      # 방어 2: 화이트리스트 (가장 확실)
+      - name: Validate approved base image (allowlist)
+        run: |
+          BASE=$(grep -m1 '^FROM' golden-base/Dockerfile | awk '{print $2}')
+          echo "Declared base image: $BASE"
+          case "$BASE" in
+            gcr.io/distroless/*@sha256:*)
+              echo "승인된 베이스 이미지입니다." ;;
+            gcr.io/distroless/*)
+              echo "::error::digest pin이 필요합니다. 태그 참조는 재현성을 보장하지 않습니다."
+              exit 1 ;;
+            *)
+              echo "::error::승인되지 않은 베이스 이미지: $BASE"
+              echo "::error::허용 목록: gcr.io/distroless/* (digest pin 필수)"
+              exit 1 ;;
+          esac
+
       - name: Set version
         id: ver
         run: |
@@ -44,8 +91,11 @@ jobs:
           if [ -z "$VERSION" ]; then
             VERSION="$(date +%Y.%m.%d)-${GITHUB_SHA::7}"
           fi
+          if [ "${{ steps.gate_branch.outputs.publish }}" != "true" ]; then
+            VERSION="test-$VERSION"
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building golden-base version: $VERSION"
+          echo "Version: $VERSION"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -56,11 +106,14 @@ jobs:
       - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 로컬 빌드만 — 스캔 통과 전엔 절대 push 안 함
+      # 빌드 — 로컬만. 검증 전엔 절대 push 안 함
       - name: Build golden base (local only)
+        run: docker build -t golden-base:candidate ./golden-base
+
+      - name: Install Trivy
         run: |
-          docker build -t golden-base:candidate ./golden-base
-          echo "Built candidate (not pushed yet)"
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
 
       - name: Cache Trivy DB
         uses: actions/cache@v4
@@ -69,7 +122,20 @@ jobs:
           key: trivy-db-${{ github.run_id }}
           restore-keys: trivy-db-
 
-      # ★ 게이트: exit-code 1 이 있어야 실제로 막힌다
+      # 방어 3: EOL 차단 (실험 2의 구멍)
+      - name: Block EOL base images
+        run: |
+          set +e
+          SCAN_OUT=$(trivy image --cache-dir ~/.cache/trivy golden-base:candidate 2>&1)
+          set -e
+          if echo "$SCAN_OUT" | grep -q "no longer supported"; then
+            echo "::error::EOL(수명 종료) OS 감지. 보안 업데이트가 제공되지 않아 취약점 탐지가 불가능합니다."
+            echo "::error::스캔 0건은 '안전'이 아니라 '탐지 불가'를 의미합니다."
+            exit 1
+          fi
+          echo "베이스 OS가 현재 지원 중입니다."
+
+      # 방어 4: 스캔 게이트
       - name: Trivy scan (GATE)
         uses: aquasecurity/trivy-action@master
         with:
@@ -81,7 +147,6 @@ jobs:
           trivyignores: .trivyignore
           cache-dir: ~/.cache/trivy
 
-      # 실패해도 결과는 기록 (추적성)
       - name: Trivy scan (SARIF)
         if: always()
         uses: aquasecurity/trivy-action@master
@@ -92,18 +157,16 @@ jobs:
           severity: ${{ env.SEVERITY_GATE }}
           cache-dir: ~/.cache/trivy
 
-      - name: Upload SARIF to Security tab
+      - name: Upload SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
 
-      # SBOM: Log4Shell 때 영향 범위를 분 단위로 특정한 그것
       - name: Generate SBOM (CycloneDX)
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            -v $PWD:/out aquasec/trivy:latest image \
-            --format cyclonedx --output /out/sbom-cyclonedx.json \
+          trivy image --cache-dir ~/.cache/trivy \
+            --format cyclonedx --output sbom-cyclonedx.json \
             golden-base:candidate
 
       - name: Upload SBOM
@@ -113,9 +176,10 @@ jobs:
           path: sbom-cyclonedx.json
           retention-days: 90
 
-      # 스캔 통과한 것만 push
+      # Push — 모든 방어 통과 + main 브랜치만
       - name: Tag and push to ECR
         id: push
+        if: steps.gate_branch.outputs.publish == 'true'
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
           IMAGE="$ECR_REGISTRY/$GOLDEN_REPO:$VERSION"
@@ -125,7 +189,12 @@ jobs:
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "::notice::Golden image published: $DIGEST"
 
+      - name: Skip push notice
+        if: steps.gate_branch.outputs.publish != 'true'
+        run: echo "::notice::검증만 수행. main 브랜치가 아니므로 ECR push를 건너뜁니다."
+
       - name: Summary
+        if: steps.gate_branch.outputs.publish == 'true'
         run: |
           {
             echo "## Golden Image Published"
@@ -134,11 +203,15 @@ jobs:
             echo "|------|-----|"
             echo "| Version | \`${{ steps.ver.outputs.version }}\` |"
             echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"
-            echo "| Scan Gate | HIGH,CRITICAL (ignore-unfixed) |"
-            echo "| SBOM | CycloneDX (artifact) |"
-            echo ""
-            echo "### 앱 Dockerfile에서 사용법"
-            echo '```dockerfile'
-            echo "FROM ${{ steps.push.outputs.digest }}"
-            echo '```'
+            echo "| 통과한 방어 | 브랜치 검증 → 화이트리스트 → EOL 차단 → 스캔 게이트 |"
           } >> $GITHUB_STEP_SUMMARY
+
+  notify-scheduled-failure:
+    needs: build-scan-push
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Alert
+        run: |
+          echo "::error::정기 스캔 실패 — 신규 HIGH/CRITICAL 취약점 발견."
+          echo "::error::조치: 베이스 digest 갱신 또는 .trivyignore에 만료일과 함께 예외 등록"
