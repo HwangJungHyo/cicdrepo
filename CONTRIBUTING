@@ -1,0 +1,198 @@
+# CONTRIBUTING — 코드 기여 가이드 (개발자용)
+
+> **이 문서는 코드를 기여하는 개발자를 위한 안내서입니다.**
+> 파이프라인 자체를 설계·운영하는 건 플랫폼팀(DevOps)의 일이고, 이 문서는 여러분이 그 **물길을 매끄럽게 타도록** 돕는 게 목적입니다.
+> 여러분은 **브랜치를 따고 → PR을 올리는 것**까지만 하면, 그 다음은 물길을 따라 자동으로 흐릅니다.
+
+---
+
+## TL;DR — 여러분이 할 일은 이게 전부
+
+```bash
+git switch main && git pull
+git switch -c feature/PROJ-142-oidc-login    # ① 브랜치 따기 (main에서만)
+# ...작업...
+git commit -m "feat(auth): add OIDC login"   # ② 커밋 (규칙 있음, §2)
+git push -u origin HEAD                        # ③ 푸시
+# GitHub에서 PR → CI 초록불 + 리뷰 1인 → Squash and Merge   ④
+```
+
+**머지하는 순간부터 자동**입니다: 이미지 빌드 → DEV 자동 배포. 여러분은 DEV에서 본인 변경을 확인만 하면 됩니다.
+(그 이후 QA/STG/PROD 승격은 §4 — 개발자는 "승격 요청"만.)
+
+> 막혔을 때 가장 자주 볼 곳: **[§5 CI가 빨간불일 때](#5-ci가-빨간불일-때-막히면-여기부터)**
+
+---
+
+## 1. 역할 경계 — 누가 무엇을 하나
+
+| 구분 | 여러분(개발자) | 플랫폼팀(DevOps) |
+|---|---|---|
+| 브랜치·커밋·PR | ✅ 직접 | — |
+| CI 게이트 통과시키기 | ✅ 코드/의존성 수정으로 | 게이트 자체 관리 |
+| DEV 확인 | ✅ 본인 변경 검증 | — |
+| 이미지 빌드/서명/스캔 | ❌ (자동, 신경 불필요) | ✅ 소유·운영 |
+| QA/STG/PROD 승격·롤백 | 승격 **요청**·PROD 확인 | ✅ 실행·게이트 |
+| 골든 이미지 파이프라인 | ❌ (참고: [GOLDEN-IMAGE.md](./docs/GOLDEN-IMAGE.md)) | ✅ 소유·운영 |
+
+> 요약: **여러분은 "물"이고, 플랫폼팀은 "물길"입니다.** 물길 구조를 몰라도 흐르는 데 지장 없게 만드는 게 이 문서의 목표입니다.
+
+---
+
+## 2. 브랜치 & 커밋 규칙
+
+### 2-1. 브랜치 네이밍
+
+**포맷:** `<type>/<ticket-id>-<kebab-case-summary>`
+
+```
+feature/PROJ-142-oidc-login
+fix/PROJ-158-null-pointer-on-healthz
+hotfix/PROJ-160-prod-token-refresh
+```
+
+| Prefix | 언제 |
+|---|---|
+| `feature/` | 새 기능 |
+| `fix/` | 일반 버그 수정 |
+| `hotfix/` | **PROD 긴급 장애** (§6) |
+| `refactor/` `chore/` `docs/` `test/` `ci/` | 각 목적대로 |
+
+규칙:
+- 소문자 + 하이픈(kebab-case). 공백/한글/특수문자 ❌. **이슈 ID 필수**(추적성).
+- **환경명 서픽스(`-dev`, `-prod`) 금지.** 환경은 브랜치가 아니라 배포 상태입니다(§4).
+- 서픽스는 기본 안 씀. 굳이 쓴다면 `-wip`(임시) 정도만.
+- **브랜치는 짧게(1~2일).** 오래 살수록 `main`과 diff가 벌어져 머지 충돌 비용↑. 큰 기능은 **Feature Flag**로 감싸 작게 쪼갭니다.
+- 모든 작업 브랜치는 **`main`에서 따고 `main`으로 병합**합니다. (환경 브랜치 없음)
+
+### 2-2. 커밋 메시지 — Conventional Commits
+
+```
+<type>(<scope>): <subject>
+
+Refs: PROJ-142
+```
+예) `feat(auth): add OIDC login`, `fix(healthz): return 503 on DB down`
+- `type`: `feat|fix|refactor|chore|docs|test|ci|perf|revert`
+- **Squash merge라 PR 제목이 최종 커밋 메시지**가 됩니다 → PR 제목도 이 규칙으로.
+
+### 2-3. PR 체크리스트
+
+```
+- [ ] 이슈 링크 (Refs: PROJ-xxx)
+- [ ] 로컬에서 lint / test 통과 (ruff check . && pytest -q)
+- [ ] CI 초록불
+- [ ] 리뷰어 ≥ 1 승인
+- [ ] 설정/시크릿 영향 시 환경별 config 반영
+```
+
+`main` 병합 조건: **CI green + 1인 승인 + Squash and Merge**. `main` 직접 push 금지(브랜치 보호로 강제).
+
+---
+
+## 3. 머지하면 무슨 일이 벌어지나 (개발자 시점)
+
+```mermaid
+flowchart LR
+    A[PR Squash Merge] -->|여기까지가 나의 일| B((── 경계 ──))
+    B --> C[자동: 이미지 빌드 + 스캔]
+    C --> D[자동: DEV 배포]
+    D --> E[나: DEV에서 내 변경 확인]
+    E -.승격은 §4.-> F[QA → STG → PROD]
+```
+
+- 빌드/스캔은 **자동**. 실패하면 알림이 오고, 대응은 대부분 §5로 해결됩니다.
+- **동일 이미지가 그대로 승격**됩니다(Build Once, Deploy Many). "DEV엔 됐는데 PROD엔 안 됨"이 구조적으로 줄어듭니다. 환경 차이는 이미지가 아니라 **설정(config)** 으로만 납니다.
+
+### push했는데 왜 배포가 안 되나요?
+**push ≠ merge.** push는 원격 feature 브랜치에 올리는 것이고, `main`에 들어가 DEV 배포가 트리거되는 건 **머지 시점**입니다.
+
+### 미완성 기능을 main에 넣어도 되나요?
+됩니다. 단 **Feature Flag로 감싸** 배포는 하되 노출은 막습니다(deploy ≠ release). 🟡 *flag 체계는 계획 단계 — 도입 전까지는 리뷰로 미완성 노출을 막습니다.*
+
+### 실행 중 파드를 kubectl로 직접 고쳐도 되나요?
+**안 됩니다.** 재시작·다음 배포 때 유실되고 이력이 깨집니다(configuration drift). 변경은 재빌드 → 새 digest → 재배포로만. distroless라 `kubectl exec`가 안 되면 `kubectl debug`(ephemeral container)를 쓰세요.
+
+---
+
+## 4. 환경별로 "내가 확인할 것"
+
+> 배포 *전략*(Rolling/Blue-Green 등)과 승격 트리거는 플랫폼팀이 정합니다. 상세는 [DEPLOYMENT.md](./docs/DEPLOYMENT.md).
+> 여기선 **개발자가 각 환경에서 뭘 하면 되는지**만 적습니다.
+
+| 환경 | 언제 뜨나 | 개발자가 할 일 | 네임스페이스 |
+|---|---|---|---|
+| **DEV** | **main 머지 직후 자동** | 본인 변경 1차 확인 (mock 데이터) | `dev` |
+| **QA** | DevOps가 `qa-*` 태그 | QA sign-off 대상, 이슈 시 재작업 | `qa` |
+| **STG** | DevOps가 `stg-*` 태그 | 배포 리허설 확인(회귀는 QA에서 종료) | `stage` |
+| **PROD** | DevOps가 `v*` 태그 + 승인 | 배포 후 기능·지표 확인 | `prod` |
+
+- **승격 순서는 `DEV → QA → STG → PROD`** (태그 스킴 `qa-*`→`stg-*`→`v*` 기준). 트리거(태그 생성)는 **DevOps 관리자**가 수행하고, 개발자는 **DEV 확인 + 승격 요청**만.
+- 내 변경이 DEV에 떴는지 확인:
+```bash
+kubectl rollout status deployment/<app> -n dev
+kubectl get deploy <app> -n dev -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+# @sha256:... digest 형태여야 정상
+```
+
+---
+
+## 5. CI가 빨간불일 때 (막히면 여기부터)
+
+**실패 단계**로 나눠 판단하세요. **내가 고칠 것 vs DevOps에 알릴 것**. (원인 / 영향 / 해결 / 검증)
+
+### 5-1. `lint` / `unit-test` 실패 → 내가 고칠 것
+- **원인:** 코드 스타일 위반 또는 테스트 깨짐.
+- **영향:** 머지 불가.
+- **해결:** 로컬 `ruff check . && pytest -q`로 재현 후 수정. 플래키 의심 시 재현 여부부터 확인.
+- **검증:** 로컬 all green → push → CI 초록불.
+
+### 5-2. `image-scan` (취약점) 실패 ← 가장 헷갈리는 곳
+- **원인:** 내가 추가/업데이트한 **의존성 또는 베이스의 알려진 취약점(CVE)** 이 게이트 기준(CRITICAL, 수정본 있는 HIGH)에 걸림. → "내 코드가 틀려서"가 아니라 "가져다 쓴 라이브러리가 취약해서"인 경우가 많음.
+- **영향:** 머지 불가.
+- **해결(우선순위):**
+  1. 취약 의존성을 **패치 버전으로 상향**(대개 이걸로 해결).
+  2. 불가 시 **대체 라이브러리** 검토.
+  3. 둘 다 불가한데 실제 영향 없으면 → **기한부 예외**(`.trivyignore`)를 **만료일·사유·승인자**와 함께 요청. 무기한 무시 금지. (정책: [GOLDEN-IMAGE.md](./docs/GOLDEN-IMAGE.md) §CVE 예외)
+- **검증:** 의존성 수정 후 push → 스캔 게이트 초록불.
+
+### 5-3. 빌드 / push / 서명 단계 실패 → DevOps에 알릴 것
+- **원인:** 대개 코드 문제가 아니라 파이프라인/인프라(레지스트리 권한, OIDC role 등).
+- **해결:** 로그 실패 지점이 빌드/스캔이 아니라 **push·서명**이면 `#platform-devops`에 로그 링크와 함께 문의.
+
+> 판단 팁: **lint/test/scan 실패 = 내가 고칠 것.** **빌드/서명/배포 인프라 실패 = 플랫폼팀에 알릴 것.**
+
+---
+
+## 6. 문제가 생겼을 때 — 핫픽스 & 롤백
+
+### Hotfix (PROD 긴급 장애)
+- **개발자:** `hotfix/`를 `main`에서 따서 **최소 변경** PR → fast-track 리뷰. **CI 게이트는 생략 금지**(급해도 스캔/테스트 통과 필수).
+- **플랫폼팀:** 승격 절차를 압축해 신속 PROD 반영.
+- ❌ 정규 절차 우회해 PROD 이미지/매니페스트를 손으로 편집하지 않습니다.
+
+### Rollback
+- **주도:** 플랫폼팀 — **재빌드 없이 이전에 검증된 digest**로 복귀. (런북: [DEPLOYMENT.md](./docs/DEPLOYMENT.md) §롤백)
+- **개발자:** 롤백 후 원인 이슈를 `fix/`·`hotfix/`로 다시 수정해 정규 플로우 재투입.
+
+---
+
+## 7. 더 깊이
+
+파이프라인이 **어떻게** 만들어졌는지는 매일 알 필요 없지만, 게이트에 막혀 배경이 필요할 때가 있습니다.
+- ➡️ **[docs/DEPLOYMENT.md](./docs/DEPLOYMENT.md)** — 환경별 배포 전략, 승격 모델, 롤백 런북, 브랜치 보호
+- ➡️ **[docs/GOLDEN-IMAGE.md](./docs/GOLDEN-IMAGE.md)** — 골든 이미지 파이프라인, 게이트 fail policy, CVE 예외, 서명
+
+여러분이 **실제로 행동해야 하는 유일한 플랫폼 접점**은 §5-2의 "취약점 게이트 실패 시 의존성 수정 또는 예외 요청"뿐입니다.
+
+---
+
+## References (기여·브랜치 전략)
+- Trunk-based Development — https://trunkbaseddevelopment.com (본 저장소 브랜치 모델의 정본)
+- Atlassian, Trunk-based development (GitFlow 비교) — 팀 설득용
+- mntnr/awesome-contributing — 잘 쓴 실제 기여 가이드 큐레이션
+- auth0/open-source-template — 복붙 가능한 CONTRIBUTING 템플릿
+
+## 문의
+- 파이프라인/게이트/배포: `#platform-devops`
+- 이 문서 수정 제안: `docs/` 프리픽스 브랜치로 PR
