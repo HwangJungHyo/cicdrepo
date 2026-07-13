@@ -1,0 +1,242 @@
+# DEPLOYMENT — CD 설계 (환경별 배포·승격·롤백)
+
+> **독자: 플랫폼팀(DevOps).** "각 환경(DEV/QA/STG/PROD)에 무엇이, 언제, 어떻게 배포되는가"와 그 **설계 근거**를 담습니다.
+> 개발자용 요약은 [CONTRIBUTING.md §4](../CONTRIBUTING.md)에 있습니다.
+>
+> 두 원칙: **① Trunk-based** (환경 = 배포 상태, 장수 브랜치 없음) · **② Build Once, Deploy Many** (커밋 SHA당 이미지 1개, 동일 **digest**를 전 환경에 승격, 환경 차이는 설정으로만).
+
+---
+
+## 목차
+1. [현재 상태 vs 로드맵 (읽기 전 필독)](#1-현재-상태-vs-로드맵-읽기-전-필독)
+2. [환경 & 승격 모델](#2-환경--승격promotion-모델)
+3. [3-1. DEV — main 머지 직후](#3-1-dev--main-머지-직후-자동)
+4. [환경별 배포 전략](#4-환경별-배포-전략)
+5. [승격 메커니즘 (태그 → digest 이동)](#5-승격-메커니즘-태그--digest-이동)
+6. [롤백 런북](#6-롤백-런북)
+7. [브랜치 보호 & Required Checks](#7-브랜치-보호--required-checks)
+8. [위협 모델 (알려진 한계)](#8-위협-모델-알려진-한계)
+9. [전제 & 확정 필요](#9-전제--확정-필요)
+
+---
+
+## 1. 현재 상태 vs 로드맵 (읽기 전 필독)
+
+이 문서는 **지금 돌아가는 것(✅)** 과 **설계했지만 아직 아닌 것(🟡)** 을 섞지 않습니다.
+
+| 축 | 현재(✅) | 로드맵(🟡) |
+|---|---|---|
+| CD 실행 방식 | **GitHub Actions push 방식** (reusable 워크플로가 `kubectl set image`) | **GitOps(ArgoCD/Flux)** 전환 — 러너가 클러스터 자격증명을 아예 안 갖게 |
+| 배포 전략 | **Rolling Update** + 헬스체크, 타임아웃 초과 시 자동 롤백 | STG/QA/PROD에 **Blue-Green / Canary** 도입 |
+| 승격 강제 | 태그 트리거(신뢰 기반) | 승인 게이트·태그 보호·**순서 강제**·서명 검증·Admission |
+| 환경 설정 | 네임스페이스별 `app-config` ConfigMap | **Kustomize base + overlays** 로 선언화 |
+
+> ⚠️ 아래 §4의 Blue-Green/Canary, §5의 GitOps sync는 **설계(🟡)** 입니다. 현재 실제 실행은 Actions push + Rolling Update입니다. 혼동을 막기 위해 각 절에 라벨을 답니다.
+
+---
+
+## 2. 환경 & 승격(promotion) 모델
+
+| 환경 | 네임스페이스 | 트리거 | 자동/수동 | 게이트 소유자 | 데이터 |
+|---|---|---|---|---|---|
+| **DEV** | `dev` | main 병합 직후 | **자동(continuous)** ✅ | — | mock/합성 |
+| **QA** | `qa` | `qa-*` 태그 | 수동(DevOps) | QA 조직 sign-off | 마스킹된 유사 |
+| **STG** | `stage` | `stg-*` 태그 | 수동(DevOps) | 플랫폼팀(리허설) | 마스킹된 유사 |
+| **PROD** | `prod` | `v*` 태그 + 승인 | 수동(승인 게이트) | 릴리스 승인자(DevOps) | 운영 |
+
+**승격 순서 = `DEV → QA → STG → PROD`.** 태그 스킴이 `qa-*` → `stg-*` → `v*`이므로 QA(검증/sign-off)가 STG(운영 리허설/pre-prod)보다 먼저입니다.
+
+### QA와 STG는 "중복 테스트"가 아니다 — 질문이 다르다
+같은 회귀를 두 번 돌리는 게 아닙니다. 두 환경은 **묻는 질문 자체가 다릅니다.**
+
+| | **QA** | **STG** |
+|---|---|---|
+| 묻는 질문 | "이 기능이 동작하나?" | "이 릴리스를 배포해도 되나?" |
+| 초점 | 기능·회귀·통합 검증 | **배포 절차·프로덕션 유사성·릴리스 sign-off** |
+| 환경 성격 | 테스트 전용(프로덕션 복제본 아닐 수 있음) | **프로덕션의 거의 정확한 복제본** |
+| 데이터 | 마스킹된 유사 | 프로덕션 유사(마이그레이션 리허설용) |
+
+> **STG를 두는 유일한 정당화는 "한 번 더 테스트"가 아니라 아래 4가지 리허설입니다.** 이 역할이 없으면 STG는 놀고 있는 환경이 되므로, 그럴 땐 STG를 로드맵으로 내리고 `DEV→QA→PROD` + feature flag로 단순화하는 편이 낫습니다(§3-2 참고).
+
+### STG의 전용 역할 (이것만 한다)
+1. **배포 전략 리허설** — PROD의 Blue-Green/Canary 전환·롤백을 프로덕션과 동일 절차로 미리 검증. (QA는 이걸 안 함)
+2. **마이그레이션 검증** — DB 스키마 변경·데이터 이관을 **프로덕션 유사 데이터**로 리허설.
+3. **통합·외부 연동 확인** — 프로덕션급 환경에서만 재현되는 연동을 점검.
+4. **릴리스 sign-off / 감사 기록** — 이해관계자·규제상 "릴리스 전 별도 검증" 근거를 남김.
+
+> ⚠️ **STG에서 새 회귀 테스트를 반복하지 않습니다.** 기능·회귀는 QA에서 끝내고, STG는 위 4가지만. STG가 회귀 저장소가 되면 QA와 역할이 겹쳐 승격만 느려집니다.
+
+> ✅ **순서 확정 근거:** STG의 역할을 "PROD 배포 리허설"로 좁혔으므로(§3-2, §4), STG는 반드시 **PROD 직전**에 와야 합니다. 그러면 QA(기능 검증)는 그 앞에 올 수밖에 없어 **`DEV→QA→STG→PROD`가 유일한 논리적 배치**입니다. 태그 스킴(`qa-*`→`stg-*`→`v*`)도 이와 일치 → 순서는 **확정**되었습니다(더 이상 미결 항목 아님).
+
+### DEV 자동 vs 그 이후 수동, 기준은?
+"**이 배포 시점을 사람이 정해야 할 이유가 있는가.**"
+- DEV는 실사용자 영향이 없으므로 자동.
+- "모든 기능이 검증 준비됐다"는 **기계가 감지 못 하는 판단**이므로, QA부터는 **태그를 찍는 한 번의 수동 결정**으로 대상을 프리징하고 이후는 자동으로 흐르게 합니다.
+- QA를 DEV(머지 트리거)에 그대로 붙이면 검증 중 코드가 밑에서 바뀌는 **moving target** 문제가 생깁니다 → 고정 태그로 프리징하는 이유.
+
+---
+
+## 3-1. DEV — main 머지 직후 (자동) ✅
+
+가장 자주 도는 경로이자 유일하게 완전 자동인 구간입니다.
+
+```mermaid
+flowchart LR
+    M[PR Squash Merge → main] --> B[build-push.yml 트리거]
+    B --> B1[lint · test]
+    B1 --> B2[image build<br/>FROM golden-base@sha256]
+    B2 --> B3[trivy 스캔 · CI 전용]
+    B3 --> B4[ECR push<br/>appns/&lt;app&gt; · Immutable<br/>tag=git-sha, digest 고정]
+    B4 --> D[DEV 배포<br/>kubectl set image<br/>ns=dev]
+    D --> H[rollout status 확인<br/>실패 시 자동 롤백]
+```
+
+**동작:**
+1. `main`에 Squash merge → `build-push.yml` 자동 트리거.
+2. lint/test → 골든 베이스 위에 이미지 빌드 → trivy 스캔(CI 전용) → **ECR Immutable push**(태그=git-sha, digest 고정).
+3. 그 digest를 `dev` 네임스페이스에 `kubectl set image` → Rolling Update.
+4. `kubectl rollout status`로 헬스 확인. 타임아웃 초과 시 자동 롤백.
+
+**주의점(실전):**
+- 컨테이너 **이름이 정확해야** 함 — 오타 시 `set image`가 **silent no-op**(에러 없이 아무 것도 안 바뀜). 배포 후 반드시 digest를 재확인.
+- DEV는 `latest` 태그 금지. 항상 **digest(`@sha256:`)** 로 참조 고정(재현성).
+- 환경값은 `app-config` ConfigMap(`ENV_NAME=development`, `LOG_LEVEL`)에서 주입 — 이미지는 전 환경 동일, 값만 다름.
+
+---
+
+## 3-2. STG가 지금 값을 하는가 (판단 기준)
+
+STG는 **비용을 정당화할 때만** 둡니다. 아래 중 하나라도 해당하면 STG 유지가 옳고, 전부 아니면 로드맵으로 내리고 `DEV→QA→PROD`로 단순화 + **feature flag로 프로덕션 테스트**가 모범사례에 가깝습니다.
+
+- [ ] DB 마이그레이션·데이터 이관을 프로덕션 유사 데이터로 리허설해야 한다
+- [ ] PROD 배포 전략(BG/Canary)을 미리 검증해야 한다
+- [ ] 외부 연동이 많아 프로덕션급 환경에서만 재현된다
+- [ ] 이해관계자 UAT·릴리스 sign-off 또는 규제상 별도 검증 기록이 필요하다
+
+> **현재 판단(추정):** 앱 규모가 작고 무상태에 가까우며 배포 전략이 아직 Rolling인 단계에서는 위 항목의 값이 낮습니다.
+> 그래서 본 문서는 **(A) STG 유지 + 역할을 §2의 4가지 리허설로 좁힘**을 채택합니다. STG를 "배포 안전성 검증 전용"으로 명확히 정의해, 규모가 커질 때(마이그레이션·통합·UAT 발생) 바로 값을 하도록 준비 상태로 둡니다.
+
+---
+
+## 4. 환경별 배포 전략
+
+| 환경 | 전략(현재/목표) | 이유 | 롤백 방식 |
+|---|---|---|---|
+| **DEV** | **Rolling Update** ✅ | 속도 우선, 짧은 다운타임 허용 | 이전 digest 재적용 |
+| **QA** | Rolling ✅ | 기능·회귀 검증이 목적(전략은 단순해도 됨) | 이전 digest 재적용 |
+| **STG** | 🟡 **PROD와 동일 전략**(Blue-Green/Canary) | **PROD 배포 절차 자체를 리허설**하는 게 STG의 존재 이유 | PROD와 동일 롤백 리허설 |
+| **PROD** | 🟡 Blue-Green 또는 Canary + 승인 | 안전 우선, 점진 노출 | 트래픽 즉시 복귀 / canary abort |
+
+### PROD 배포 세부 (🟡 설계)
+- **Blue-Green:** green 준비 → 헬스체크 통과 → 트래픽 전환 → blue는 N분 대기(즉시 롤백용) 후 회수.
+- **Canary:** 5% → 25% → 100% 점진. 각 단계에서 SLO(에러율/latency) 임계 감시, 초과 시 자동 롤백.
+- **승인 게이트:** GitHub Environments `Required reviewers` + (권장) 배포 freeze window.
+
+> 현재 표준(replica/PDB/HPA, 성공 판정 기준)은 **"헬스체크 통과 = 성공, 타임아웃 초과 = 자동 롤백"** 수준까지 확정. 세부 전략(BG/Canary)은 로드맵에서 도입합니다.
+
+---
+
+## 5. 승격 메커니즘 (태그 → digest 이동)
+
+**핵심: 승격은 "새 빌드"가 아니라 "동일 digest를 다음 환경에 지정"입니다.**
+
+- **왜 digest 단위인가?** 태그는 재지정 가능한 이름표라 같은 태그가 다른 내용을 가리킬 수 있습니다. digest는 SHA-256이라 같으면 반드시 같은 바이트. "테스트한 것 = 배포한 것"을 보장하려면 승격 단위가 digest여야 하고, **재빌드하면 의존성 해결이 달라져 그 보장이 깨집니다.**
+- **QA에서 sign-off된 바로 그 digest만** STG/PROD 대상이 됩니다. 중간 재빌드 금지.
+
+### 현재(✅ Actions push)
+`deploy-qa.yml` / `deploy-stg.yml` / `deploy-prod.yml`(얇은 호출) → 공통 `deploy.reusable.yml`(digest 조회 → `set image` → rollout → 헬스체크 → 실패 시 롤백). 환경명·**환경별 OIDC 역할**·승인 게이트만 다르게. 이 하이브리드로 DRY + 환경별 권한 분리(blast radius↓) + PROD 승인 격리를 모두 만족.
+
+### 목표(🟡 GitOps)
+각 환경 overlay(`overlays/{dev,qa,stg,prod}`)에서 **이미지 digest 필드만** 다름. 승격 = 검증된 digest를 다음 overlay에 반영하는 PR/자동 커밋 → 컨트롤러가 sync. **롤백 = 그 커밋을 `git revert`.**
+
+---
+
+## 6. 롤백 런북
+
+**원칙: 재빌드 없이 "이전에 검증된 digest"로 복귀.**
+
+### 6-1. Rolling(현재)
+```bash
+# 직전 digest 확인
+kubectl get deploy <app> -n <ns> -o jsonpath='{.spec.template.spec.containers[0].image}'; echo
+kubectl rollout history deploy/<app> -n <ns>
+
+# 응급 롤백 (이미지=파드 템플릿만 되돌림 — ConfigMap 변경은 별도 확인)
+kubectl rollout undo deploy/<app> -n <ns>
+```
+> `kubectl rollout undo`는 **응급용**입니다. 이력·드리프트를 남기므로, 정본 경로는 파이프라인 재실행(이전 SHA 지정)으로 복귀.
+
+### 6-2. Blue-Green / Canary (🟡 설계)
+1. Blue-Green: 트래픽을 **blue(이전 버전)로 즉시 전환**.
+2. Canary: 롤아웃 **abort** → 100% 이전 버전 유지.
+3. 헬스체크·SLO 회복 확인.
+4. 원인 이슈는 `fix/`·`hotfix/`로 재작업 후 정규 플로우 재투입.
+
+### 6-3. GitOps (🟡 목표)
+`overlays/prod`의 digest를 이전 SHA로 되돌리는 **`git revert` PR** → 컨트롤러가 이전 known-good로 sync. **드리프트 0.**
+
+---
+
+## 7. 브랜치 보호 & Required Checks
+
+> 전략이 성립하려면 개발자가 규칙을 **우회할 수 없어야** 합니다.
+
+`main` 설정:
+- 직접 push 금지, PR로만, **Squash merge only**, Linear history.
+- **Required status checks(green이어야 Merge 활성):** `lint`, `unit-test`, `image-scan` (+ 해당 시 SAST).
+- **≥1 approval** + stale review dismissal(코드 변경 시 기존 승인 무효).
+- Require branches **up to date before merging**(머지 전 main 최신화 강제).
+
+환경 보호:
+- GitHub Environments `production`(및 확장 시 `qa`/`stage`)에 **Required reviewers**.
+- (권장) 태그 보호 규칙: `qa-*`/`stg-*`/`v*` push 권한 제한.
+
+> 🟡 현재 이 항목들은 상당수 **규칙(문서)** 수준이며 기계적 강제(required checks·CODEOWNERS·태그 보호)는 로드맵 Tier 1입니다.
+
+---
+
+## 8. 위협 모델 (알려진 한계)
+
+정직하게 남깁니다. 아래는 우선순위 순.
+
+1. **⚠️ 강제 지점이 CI에만 있음.** CI를 우회한 `kubectl apply`로 임의 이미지를 직접 배포하면 화이트리스트·스캔을 전부 우회합니다. 최후 방어선인 **Admission Controller(Kyverno/OPA)가 없어**, "골든에서 파생·서명되지 않은 이미지는 뜰 수 없다"를 기계가 강제하지 못합니다.
+2. **⚠️ 러너 blast radius.** CI 러너는 신뢰가 가장 집중된 노드(ECR push + 클러스터 배포 + 서드파티 의존성 + PR 코드). **러너 탈취 = 골든 오염 + PROD 배포 동시 가능.** 대응: **환경별 OIDC 역할 분리**(golden-publisher / app-ci / app-deployer).
+3. **⚠️ 승격 순서 미강제.** 현재 승격은 강제가 아니라 신뢰. `qa-*` 태그 시 `ImageNotFound`는 "빌드된 적 없는 커밋"만 거를 뿐, "실제로 QA를 통과한 커밋인가"는 검증하지 않습니다. → 순서 강제(선행 태그 계보 검증)·QA 통과 status-check.
+4. **⚠️ 우발적 취약점엔 강하나 의도적 변조엔 약함.** 스캔·화이트리스트는 CVE는 잘 잡지만 의도적 백도어는 CVE가 아니라 통과. **서명·provenance가 없어 "우리가 만든 이미지"임을 증명 못 함**(공급망 공격에 취약). → Cosign 서명 + SLSA. 상세: [GOLDEN-IMAGE.md](./GOLDEN-IMAGE.md).
+5. **🟡 Secret at-rest.** 현재 앱 Secret이 없어 노출면은 낮음(`app-config`는 비민감값만 보유 — 올바른 사용). Secret 도입 전 **EKS etcd KMS 봉투 암호화**를 선제 적용이 baseline. 규칙: **민감값은 ConfigMap 금지, k8s Secret(+External Secrets)**.
+
+### 로드맵 요약 (강제 지점 + blast radius 축소 우선)
+- **Tier 1:** 태그 남용 방지 4종(환경 승인 게이트·태그 보호·순서 강제·QA status-check) · required checks+CODEOWNERS 강제 · 환경별 OIDC 역할 분리 · **Admission Controller** · Immutable 앱 repo 정착.
+- **Tier 2:** Cosign 서명+검증 → Admission이 서명까지 · SLSA provenance/SBOM 바인딩 · 빌드 이미지 거버넌스.
+- **Tier 3:** Kustomize overlays · Terraform(ECR/IAM/OIDC) · Feature Flag(kill-switch→per-feature→OpenFeature) · etcd KMS · **중기 GitOps(ArgoCD/Flux) 전환**(전환 시 '환경별 OIDC 분리'는 PR 승인 흐름으로 흡수).
+
+---
+
+## 9. 전제 & 확정 필요
+
+| 항목 | 현재 값 | 확정 필요 |
+|---|---|---|
+| VCS/CI | GitHub + Actions | |
+| 런타임 | EKS | |
+| CD 방식 | **Actions push (현재)** | GitOps 전환 시점 |
+| 레지스트리 | ECR (immutable) | |
+| 인증 | GitHub OIDC 키리스 | |
+| 서명 | 미도입 → Cosign keyless(계획) | 사설 키(KMS) 여부 |
+| **승격 순서** | **`DEV→QA→STG→PROD`** (태그 qa-*/stg-*/v*) | ✅ 확정 — STG=리허설 역할이 순서를 강제함 |
+| **STG 역할** | **배포 리허설·마이그레이션 검증 전용**(회귀 반복 아님) — (A) 채택 | 규모 확대 시 UAT/통합 역할 추가 |
+| 배포 전략 | Rolling(현재) → BG/Canary(목표) | PROD 전략 확정 |
+| 정기 리빌드 | 주 1회(가정) | 주기 확정 |
+| 취약점 차단선 | CRITICAL + fixable HIGH | 조직 리스크 정책 정렬 |
+
+---
+
+## References (CD·승격·공급망)
+- AWS Prescriptive Guidance — *Trunk branching for multi-account DevOps* (다중 환경 승격 관점)
+- Building trunk-based delivery with ArgoCD (승격/롤백 실전 예시) — GitOps 전환 시 참고
+- SLSA framework — https://slsa.dev (빌드 무결성 L1~L3)
+- Sigstore / Cosign — keyless 서명·검증, Admission 정책
+- OpenSSF Sigstore 도입 사례 — policy-controller 운영 caveat
+
+## 문의 / 소유
+- 소유: 플랫폼팀 `#platform-devops`
+- 개발자 안내: [../CONTRIBUTING.md](../CONTRIBUTING.md) · 골든 이미지: [GOLDEN-IMAGE.md](./GOLDEN-IMAGE.md)
